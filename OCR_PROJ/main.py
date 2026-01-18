@@ -45,7 +45,6 @@ async def extract_text(request: Request, Images: List[UploadFile] = File(...), r
         content = await img.read()
         img_hash = hashlib.md5(content).hexdigest()
         
-        #Redis Caching
         if img_hash in image_hashes:
             cache_hits += 1
             response[img.filename] = image_hashes[img_hash]
