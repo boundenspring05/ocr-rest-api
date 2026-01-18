@@ -1,3 +1,4 @@
+import hashlib
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from typing import List
 import time
@@ -31,39 +32,53 @@ def get_redis():
 @limiter.limit("10/minute")
 @limiter.limit("100/hour")
 async def extract_text(request: Request, Images: List[UploadFile] = File(...), redis=Depends(get_redis)):
-    if not Images:
-        raise HTTPException(status_code=400, detail="No images provided")
-    
-    if len(Images) > 50:
-        raise HTTPException(status_code=413, detail="Max 50 images per request")
-
-    for img in Images:
-        if not img.content_type or not img.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail=f"Invalid file type: {img.content_type or 'unknown'}")
-        if img.size and img.size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"File too large: {img.filename}")
 
     response = {}
     s = time.time()
     tasks = []
+    cache_hits = 0
+    image_hashes = {}
     
     for img in Images:
         print("Images Uploaded: ", img.filename)
+        
+        content = await img.read()
+        img_hash = hashlib.md5(content).hexdigest()
+        
+        if img_hash in image_hashes:
+            cache_hits += 1
+            response[img.filename] = image_hashes[img_hash]
+            continue
+        if await redis.get(f"ocr:cache:{img_hash}"):
+            cache_hits += 1
+            text = (await redis.get(f"ocr:cache:{img_hash}"))
+            response[img.filename] = text
+            continue
+            
+        await img.seek(0)
+        
         file_counter = await redis.incr("ocr:global_file_counter")
         counter = [file_counter]
         
         tasks.append(asyncio.create_task(
             utils.process_with_cleanup(img, ocr.read_image, counter)
         ))
+        tasks[-1].img_hash = img_hash
     
-    texts = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for i, text in enumerate(texts):
-        if isinstance(text, Exception):
-            response[Images[i].filename] = f"[OCR ERROR] {str(text)}"
-        else:
-            response[Images[i].filename] = str(text).strip()
+    if tasks:
+        texts = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, task in enumerate(tasks):
+            if isinstance(texts[i], Exception):
+                response[Images[len(response)].filename] = f"[OCR ERROR] {str(texts[i])}"
+            else:
+                text = str(texts[i]).strip()
+
+                await redis.setex(f"ocr:cache:{task.img_hash}", 300, text)
+                response[Images[len(response)].filename] = text
     
     response["Time Taken"] = round((time.time() - s), 2)
     response["image_count"] = len(Images)
+    response["cache_hits"] = cache_hits
+    response["cache_misses"] = len(Images) - cache_hits
+    
     return response
