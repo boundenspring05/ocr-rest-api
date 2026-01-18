@@ -9,7 +9,6 @@ def save_file_context(uploaded_file, counter, path="."):
     extension = os.path.splitext(uploaded_file.filename)[-1]
     
     unique_name = f"file{counter[0]}{extension}"
-    counter[0]+=1
     temp_file = os.path.join(path, unique_name)
     
     try:

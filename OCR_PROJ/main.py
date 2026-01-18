@@ -1,53 +1,57 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from typing import List
 import time
 import asyncio
-import hashlib
 import ocr
 import utils
+import redis.asyncio as aioredis
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from contextlib import asynccontextmanager
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.redis = await aioredis.from_url("redis://localhost:6379", 
+                                            encoding="utf-8", decode_responses=True)
+    print("Redis connected for OCR API")
+    yield  
+    await app.state.redis.close()
+    print("Redis disconnected")
+
+app = FastAPI(lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-@app.get('/')
-def home():
-    return {'message': "OCR API - POST to /api/v1/extract_text"}
+def get_redis():
+    return app.state.redis
 
 @app.post("/api/v1/extract_text")
 @limiter.limit("10/minute")
 @limiter.limit("100/hour")
-async def extract_text(request: Request, Images: List[UploadFile] = File(...)):
+async def extract_text(request: Request, Images: List[UploadFile] = File(...), redis=Depends(get_redis)):
     if not Images:
         raise HTTPException(status_code=400, detail="No images provided")
     
     if len(Images) > 50:
-        raise HTTPException(status_code=413, detail="Max 10 images per request")
-    
+        raise HTTPException(status_code=413, detail="Max 50 images per request")
+
     for img in Images:
         if not img.content_type or not img.content_type.startswith('image/'):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid file type: {img.content_type or 'unknown'}"
-            )
-        
+            raise HTTPException(status_code=400, detail=f"Invalid file type: {img.content_type or 'unknown'}")
         if img.size and img.size > 10 * 1024 * 1024:
-            raise HTTPException(
-                status_code=413, 
-                detail=f"File too large: {img.filename} ({img.size} bytes)"
-            )
-    
-    counter = [0]
+            raise HTTPException(status_code=413, detail=f"File too large: {img.filename}")
+
     response = {}
     s = time.time()
     tasks = []
     
     for img in Images:
         print("Images Uploaded: ", img.filename)
+        file_counter = await redis.incr("ocr:global_file_counter")
+        counter = [file_counter]
+        
         tasks.append(asyncio.create_task(
             utils.process_with_cleanup(img, ocr.read_image, counter)
         ))
@@ -62,14 +66,4 @@ async def extract_text(request: Request, Images: List[UploadFile] = File(...)):
     
     response["Time Taken"] = round((time.time() - s), 2)
     response["image_count"] = len(Images)
-    
     return response
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "rate_limiting": "active",
-        "max_images_per_request": 10,
-        "limits": {"minute": 10, "hour": 100}
-    }
